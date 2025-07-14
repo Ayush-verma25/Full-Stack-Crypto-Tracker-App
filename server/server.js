@@ -43,90 +43,60 @@ const HistoryDataSchema = new mongoose.Schema({
   timestamp: { type: Date, default: Date.now }
 });
 
-const CurrentData = mongoose.model('CurrentData', CurrentData);
+const CurrentData = mongoose.model('CurrentData', CurrentDataSchema);
 const HistoryData = mongoose.model('HistoryData', HistoryDataSchema);
 
 // Rate limiting variables
 let lastFetchTime = 0;
-const MIN_FETCH_INTERVAL = 120000; // 2 minutes minimum between API calls
-let fetchInProgress = false;
-
-// Exponential backoff for retries
-async function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
+const RATE_LIMIT_DELAY = 60000; // 1 minute between requests
+let fetchRetryCount = 0;
+const MAX_RETRIES = 3;
 
 // Fetch data from CoinGecko with rate limiting and retry logic
 async function fetchCoinGeckoData() {
-  // Check if we should skip this call due to rate limiting
-  const now = Date.now();
-  if (now - lastFetchTime < MIN_FETCH_INTERVAL) {
-    console.log('Skipping API call due to rate limiting');
-    return null;
-  }
-
-  // Prevent concurrent API calls
-  if (fetchInProgress) {
-    console.log('API call already in progress, skipping');
-    return null;
-  }
-
-  fetchInProgress = true;
-  let retryCount = 0;
-  const maxRetries = 3;
-  
   try {
-    while (retryCount < maxRetries) {
-      try {
-        console.log(`Fetching data from CoinGecko (attempt ${retryCount + 1})`);
-        
-        const response = await axios.get(
-          'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1&sparkline=false',
-          {
-            timeout: 10000, // 10 second timeout
-            headers: {
-              'User-Agent': 'CryptoTracker/1.0'
-            }
-          }
-        );
-        
-        lastFetchTime = now;
-        console.log('Successfully fetched data from CoinGecko');
-        return response.data;
-        
-      } catch (error) {
-        retryCount++;
-        
-        if (error.response?.status === 429) {
-          console.log(`Rate limited (429), waiting before retry ${retryCount}/${maxRetries}`);
-          // Exponential backoff: 30s, 60s, 120s
-          await delay(30000 * Math.pow(2, retryCount - 1));
-        } else if (retryCount < maxRetries) {
-          console.log(`API error (${error.response?.status}), retrying in 10s...`);
-          await delay(10000);
-        } else {
-          throw error;
-        }
-      }
+    const now = Date.now();
+    const timeSinceLastFetch = now - lastFetchTime;
+    
+    // Ensure we don't exceed rate limits
+    if (timeSinceLastFetch < RATE_LIMIT_DELAY) {
+      const waitTime = RATE_LIMIT_DELAY - timeSinceLastFetch;
+      console.log(`Rate limit protection: waiting ${waitTime}ms before next request`);
+      await new Promise(resolve => setTimeout(resolve, waitTime));
     }
     
-    throw new Error('Max retries exceeded');
+    const response = await axios.get(
+      'https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1&sparkline=false',
+      {
+        timeout: 10000, // 10 second timeout
+        headers: {
+          'User-Agent': 'CryptoTracker/1.0'
+        }
+      }
+    );
     
-  } finally {
-    fetchInProgress = false;
+    lastFetchTime = Date.now();
+    fetchRetryCount = 0; // Reset retry count on success
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching from CoinGecko:', error.message);
+    
+    if (error.response?.status === 429 && fetchRetryCount < MAX_RETRIES) {
+      fetchRetryCount++;
+      const backoffTime = Math.min(1000 * Math.pow(2, fetchRetryCount), 60000); // Exponential backoff, max 1 minute
+      console.log(`Rate limited. Retrying in ${backoffTime}ms (attempt ${fetchRetryCount}/${MAX_RETRIES})`);
+      await new Promise(resolve => setTimeout(resolve, backoffTime));
+      return fetchCoinGeckoData(); // Retry
+    }
+    
+    throw error;
   }
 }
 
-// Update current data with improved error handling
+// Update current data with error handling
 async function updateCurrentData() {
   try {
     const coinData = await fetchCoinGeckoData();
-    
-    // If we couldn't fetch new data due to rate limiting, return existing data
-    if (!coinData) {
-      console.log('Using existing data due to rate limiting');
-      return await CurrentData.find().sort({ rank: 1 });
-    }
     
     // Clear existing current data
     await CurrentData.deleteMany({});
@@ -151,31 +121,20 @@ async function updateCurrentData() {
   } catch (error) {
     console.error('Error updating current data:', error.message);
     
-    // Return existing data if update fails
-    try {
-      const existingData = await CurrentData.find().sort({ rank: 1 });
-      if (existingData.length > 0) {
-        console.log('Returning existing data after update failure');
-        return existingData;
-      }
-    } catch (dbError) {
-      console.error('Error fetching existing data:', dbError.message);
+    // If it's a rate limit error, don't throw - just log and continue
+    if (error.response?.status === 429) {
+      console.log('Rate limited - will retry on next scheduled update');
+      return [];
     }
     
     throw error;
   }
 }
 
-// Store history data with improved error handling
+// Store history data with error handling
 async function storeHistoryData() {
   try {
     const coinData = await fetchCoinGeckoData();
-    
-    // Skip if we couldn't fetch new data
-    if (!coinData) {
-      console.log('Skipping history storage due to rate limiting');
-      return;
-    }
     
     const historyData = coinData.map(coin => ({
       coinId: coin.id,
@@ -191,20 +150,22 @@ async function storeHistoryData() {
     console.log('History data stored successfully');
   } catch (error) {
     console.error('Error storing history data:', error.message);
-    // Don't throw error for history storage failures
+    
+    // If it's a rate limit error, don't throw - just log and continue
+    if (error.response?.status === 429) {
+      console.log('Rate limited - will retry on next scheduled update');
+    }
   }
 }
 
-// API Routes
-
-// Root route for health checks
+// Root route to fix "Cannot GET /" error
 app.get('/', (req, res) => {
   res.json({
     success: true,
     message: 'Crypto Tracker API is running',
-    timestamp: new Date(),
+    version: '1.0.0',
     endpoints: {
-      coins: '/api/coins',
+      current: '/api/coins',
       history: '/api/history/:coinId',
       portfolio: '/api/portfolio'
     }
@@ -217,9 +178,11 @@ app.get('/health', (req, res) => {
     success: true,
     status: 'healthy',
     timestamp: new Date(),
-    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+    uptime: process.uptime()
   });
 });
+
+// API Routes
 
 // GET /api/coins - Fetch current cryptocurrency data
 app.get('/api/coins', async (req, res) => {
@@ -230,27 +193,24 @@ app.get('/api/coins', async (req, res) => {
     if (currentData.length === 0 || 
         (currentData[0] && Date.now() - currentData[0].timestamp > 3600000)) {
       try {
-        currentData = await updateCurrentData();
-      } catch (error) {
-        console.error('Failed to update data, using existing data:', error.message);
-        // If update fails, still return existing data if available
-        if (currentData.length === 0) {
-          throw error;
+        const newData = await updateCurrentData();
+        if (newData.length > 0) {
+          currentData = newData;
         }
+      } catch (error) {
+        console.log('Failed to fetch new data, using existing data if available');
       }
     }
     
     res.json({
       success: true,
       data: currentData,
-      timestamp: new Date(),
-      dataAge: currentData.length > 0 ? Date.now() - currentData[0].timestamp : 0
+      timestamp: new Date()
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      error: error.message,
-      message: 'Unable to fetch cryptocurrency data'
+      error: error.message
     });
   }
 });
@@ -304,21 +264,10 @@ app.get('/api/portfolio', async (req, res) => {
   try {
     const currentData = await CurrentData.find().sort({ rank: 1 });
     
-    if (currentData.length === 0) {
-      return res.json({
-        success: true,
-        data: {
-          totalValue: 0,
-          avgChange: 0,
-          coins: []
-        },
-        message: 'No data available'
-      });
-    }
-    
     // Calculate portfolio metrics
     const totalMarketCap = currentData.reduce((sum, coin) => sum + coin.marketCap, 0);
-    const avgChange = currentData.reduce((sum, coin) => sum + coin.change24h, 0) / currentData.length;
+    const avgChange = currentData.length > 0 ? 
+      currentData.reduce((sum, coin) => sum + coin.change24h, 0) / currentData.length : 0;
     
     const portfolioData = currentData.slice(0, 6).map(coin => ({
       name: coin.name,
@@ -344,8 +293,8 @@ app.get('/api/portfolio', async (req, res) => {
   }
 });
 
-// Cron Jobs with reduced frequency
-// Update current data every 2 hours (was 30 minutes)
+// Cron Jobs - Reduced frequency to avoid rate limits
+// Update current data every 2 hours instead of 30 minutes
 cron.schedule('0 */2 * * *', async () => {
   console.log('Running scheduled update of current data...');
   try {
@@ -355,7 +304,7 @@ cron.schedule('0 */2 * * *', async () => {
   }
 });
 
-// Store history data every 4 hours (was 1 hour)
+// Store history data every 4 hours instead of every hour
 cron.schedule('0 */4 * * *', async () => {
   console.log('Running scheduled storage of history data...');
   try {
@@ -365,46 +314,42 @@ cron.schedule('0 */4 * * *', async () => {
   }
 });
 
-// Initialize data on startup with delay
+// Initialize data on startup with better error handling
 async function initializeData() {
   try {
     console.log('Initializing data...');
     
-    // Wait a bit before making the first API call
-    await delay(5000);
-    
-    // Try to update current data
-    try {
-      await updateCurrentData();
-    } catch (error) {
-      console.error('Failed to initialize current data:', error.message);
+    // Check if we have existing data
+    const existingData = await CurrentData.find();
+    if (existingData.length > 0) {
+      console.log('Found existing data, skipping initial API call');
+      return;
     }
     
-    // Wait before storing history
-    await delay(10000);
+    // Only fetch if we don't have data
+    console.log('No existing data found, fetching initial data...');
+    await updateCurrentData();
     
-    // Try to store history data
-    try {
-      await storeHistoryData();
-    } catch (error) {
-      console.error('Failed to initialize history data:', error.message);
-    }
+    // Add a delay before storing history to avoid rate limits
+    setTimeout(async () => {
+      try {
+        await storeHistoryData();
+        console.log('Data initialization complete');
+      } catch (error) {
+        console.error('Error storing initial history data:', error.message);
+      }
+    }, 30000); // 30 second delay
     
-    console.log('Data initialization complete');
   } catch (error) {
     console.error('Error initializing data:', error.message);
-    // Don't crash the server if initialization fails
+    console.log('Server will continue without initial data fetch');
   }
 }
 
 // Start server
 app.listen(PORT, async () => {
   console.log(`Server running on port ${PORT}`);
-  
-  // Initialize data with error handling
-  setTimeout(async () => {
-    await initializeData();
-  }, 2000); // Wait 2 seconds before initialization
+  await initializeData();
 });
 
 // Graceful shutdown
