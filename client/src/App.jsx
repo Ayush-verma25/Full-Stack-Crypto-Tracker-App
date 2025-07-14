@@ -34,7 +34,7 @@ const CryptoTracker = () => {
   // Fetch coins data
   const fetchCoins = async () => {
     try {
-      const response = await fetch("http://localhost:5000/api/coins");
+      const response = await fetch("https://full-stack-crypto-tracker-app-server.onrender.com/api/coins");
       const data = await response.json();
       if (data.success) {
         setCoins(data.data);
@@ -50,7 +50,7 @@ const CryptoTracker = () => {
   // Fetch portfolio data
   const fetchPortfolio = async () => {
     try {
-      const response = await fetch("http://localhost:5000/api/portfolio");
+      const response = await fetch("https://full-stack-crypto-tracker-app-server.onrender.com/api/portfolio");
       const data = await response.json();
       if (data.success) {
         setPortfolio(data.data);
